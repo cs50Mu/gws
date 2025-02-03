@@ -14,14 +14,14 @@ const (
 func main() {
 	ln, err := net.Listen("tcp", ADDR)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
 
 	log.Printf("listening on: %v\n", ADDR)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			panic(err)
+			log.Fatal(err)
 		}
 		go handleConn(conn)
 	}
@@ -30,14 +30,28 @@ func main() {
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 	// handle conn
-	ws := gws.NewWS(conn)
+	ws := gws.NewServerWS(conn)
 	if err := ws.ServerHandshake(); err != nil {
 		badRequest(conn)
 		return
 	}
 	log.Println("server handshake done")
-	if err := ws.ReadLoop(msgHandler); err != nil {
-		log.Printf("ServerLoop failed, err: %v", err)
+
+	// if err := ws.ReadLoop(msgHandler); err != nil {
+	// 	log.Printf("ServerLoop failed, err: %v", err)
+	// }
+
+	for {
+		msgType, payload, err := ws.ReadMsg()
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("[Server] recved msg, type: %v, payload: %+v",
+			msgType.String(), payload)
+		// echo back
+		if err := ws.WriteMsg(msgType, payload); err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 
@@ -46,7 +60,8 @@ func badRequest(conn net.Conn) {
 	conn.Write([]byte("\r\n"))
 }
 
-func msgHandler(payload []byte, ws *gws.WS) error {
-	log.Printf("writing payload in msgHandler: %v\n", string(payload))
-	return ws.ServerWriteText(payload, true)
+func msgHandler(msg *gws.Msg, ws *gws.WS) error {
+	log.Printf("[Server] reved msg, type: %v, payload: %+v\n",
+		msg.Opcode.String(), msg.Payload)
+	return ws.WriteMsg(msg.Opcode, msg.Payload)
 }

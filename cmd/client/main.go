@@ -32,43 +32,49 @@ func main() {
 	}
 	defer conn.Close()
 
-	ws := gws.NewWS(conn)
+	ws := gws.NewClientWS(conn)
 
 	err = ws.ClientHandshake(HOST)
 	if err != nil {
 		panic(err)
 	}
 
-	// payload := []byte(nil)
-	// opcode := gws.OpcodePing
-	// // payload := []byte("hello, websocket!")
-	// // opcode := gws.OpcodeText
-	// if err = ws.WriteFrame(payload, opcode, true, true); err != nil {
-	// 	panic(err)
-	// }
 	var payload bytes.Buffer
 	for i := 0; i < math.MaxUint16; i++ {
 		payload.WriteByte('E')
 	}
 	log.Printf("payloadLen: %v\n", payload.Len())
 
-	if err = ws.ClientWriteText(payload.Bytes(), false); err != nil {
-		panic(err)
-	}
-
-	if err = ws.ClientWriteText([]byte("world"), true); err != nil {
-		panic(err)
-	}
-
-	// if err = ws.WriteFrame(nil, gws.OpcodeClose, true, true); err != nil {
+	// if err = ws.WriteMsg(gws.OpcodeText, payload.Bytes()); err != nil {
 	// 	panic(err)
 	// }
+	if err = ws.WriteMsg(gws.OpcodeText, []byte("hello, from websocket")); err != nil {
+		log.Fatal(err)
+	}
 
-	if err = ws.ReadLoop(msgHandler); err != nil {
-		panic(err)
+	if err = ws.WriteMsg(gws.OpcodeText, []byte("world")); err != nil {
+		log.Fatal(err)
+	}
+
+	if err = ws.WriteMsg(gws.OpcodeBin, []byte{0xff, 0x00, 0x11}); err != nil {
+		log.Fatal(err)
+	}
+
+	// if err = ws.ReadLoop(msgHandler); err != nil {
+	// 	log.Fatal(err)
+	// }
+
+	for {
+		msgType, payload, err := ws.ReadMsg()
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Printf("[client] recved msg, type: %v, payload: %+v\n", msgType.String(), payload)
 	}
 }
 
-func msgHandler(payload []byte, ws *gws.WS) error {
+func msgHandler(msg *gws.Msg, ws *gws.WS) error {
+	var _ = msg
+	var _ = ws
 	return nil
 }

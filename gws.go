@@ -20,6 +20,13 @@ var (
 	ErrBadClientHandshake = errors.New("bad client handshake")
 	ErrUnknownOpcode      = errors.New("unknown opcode")
 	ErrConnClosed         = errors.New("conn is closed")
+	ErrCloseMsgRecved     = errors.New("Close msg is recved from the peer")
+)
+
+const (
+	// the max chunk size when writing a frame
+	// msg with a bigger size will be splitted
+	MSG_MAX_CHUNK_SIZE = 5
 )
 
 type WS struct {
@@ -27,15 +34,25 @@ type WS struct {
 	bufw     *bufio.Writer
 	bufr     *bufio.Reader
 	isClosed bool
+	isClient bool
 	opcode   Opcode
 }
 
-func NewWS(conn net.Conn) *WS {
+func newWS(conn net.Conn, isClient bool) *WS {
 	return &WS{
-		conn: conn,
-		bufw: bufio.NewWriter(conn),
-		bufr: bufio.NewReader(conn),
+		conn:     conn,
+		bufw:     bufio.NewWriter(conn),
+		bufr:     bufio.NewReader(conn),
+		isClient: isClient,
 	}
+}
+
+func NewClientWS(conn net.Conn) *WS {
+	return newWS(conn, true)
+}
+
+func NewServerWS(conn net.Conn) *WS {
+	return newWS(conn, false)
 }
 
 func (ws *WS) ServerHandshake() error {
@@ -263,31 +280,27 @@ type Frame struct {
 }
 
 func (ws *WS) ReadFrame() (*Frame, error) {
-	first, err := ws.bufr.ReadByte()
+	data := make([]byte, 2)
+	_, err := io.ReadFull(ws.bufr, data)
 	if err != nil {
 		return nil, err
 	}
 
 	frame := new(Frame)
 	isFinal := false
-	fin := first >> 7
+	fin := data[0] >> 7
 	if fin == 0x1 {
 		isFinal = true
 	}
-	opcode := first & 0xf
+	opcode := data[0] & 0xf
 	frame.IsFin = isFinal
 	frame.Opcode = Opcode(opcode)
-	// second byte
-	second, err := ws.bufr.ReadByte()
-	if err != nil {
-		return nil, err
-	}
 	isMask := false
-	maskBit := second >> 7
+	maskBit := data[1] >> 7
 	if maskBit == 0x1 {
 		isMask = true
 	}
-	payloadLen := second & (^(byte(0x1) << 7))
+	payloadLen := data[1] & (^(byte(0x1) << 7))
 
 	var realPayloadlen uint64
 	if payloadLen < 126 {
@@ -306,7 +319,6 @@ func (ws *WS) ReadFrame() (*Frame, error) {
 			return nil, err
 		}
 		realPayloadlen = binary.BigEndian.Uint64(data)
-		// realPayloadlen |= ^(0x1 << 63)
 	}
 
 	var mask []byte
@@ -321,7 +333,6 @@ func (ws *WS) ReadFrame() (*Frame, error) {
 	log.Printf("recved payloadLen: %v\n", realPayloadlen)
 	// payload
 	if realPayloadlen > 0 {
-		// todo: make will panic if realPayloadlen is too big
 		payload := make([]byte, realPayloadlen)
 		_, err = io.ReadFull(ws.bufr, payload)
 		if err != nil {
@@ -337,13 +348,77 @@ func (ws *WS) ReadFrame() (*Frame, error) {
 	return frame, nil
 }
 
+// ReadMsg read msg from the websocket
+// only Text or Bin msg are returned for caller to handle
+// other msgs: Ping/Pong are handled automaticly, Close msg are
+// returned as error
+func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
+	var frame *Frame
+	var buf bytes.Buffer
+	for {
+		frame, err = ws.ReadFrame()
+		if err != nil {
+			return
+		}
+		switch frame.Opcode {
+		case OpcodePing:
+			log.Println("got ping msg")
+			if err = ws.WriteFrame(frame.Payload, OpcodePong, true, false); err != nil {
+				return
+			}
+		case OpcodePong:
+			// ignore
+			continue
+		case OpcodeClose:
+			log.Println("got close msg")
+			if err = ws.WriteFrame(frame.Payload, OpcodeClose, true, false); err != nil {
+				return
+			}
+			ws.isClosed = true
+			// close the underlying conn
+			// ws.conn.Close()
+			err = ErrCloseMsgRecved
+			return
+		case OpcodeCont:
+			// log.Println("got cont msg")
+			if frame.IsFin {
+				buf.Write(frame.Payload)
+				// log.Printf("got fragmented msg: %v", buf.String())
+				payload = make([]byte, buf.Len())
+				copy(payload, buf.Bytes()) // need deep copy
+				buf.Reset()
+				return
+			} else {
+				buf.Write(frame.Payload)
+			}
+		case OpcodeBin, OpcodeText:
+			// log.Printf("got data msg: %v\n", string(frame.Payload))
+			msgType = frame.Opcode
+			if frame.IsFin {
+				payload = make([]byte, len(frame.Payload))
+				copy(payload, frame.Payload) // need deep copy
+				buf.Reset()
+				return
+			} else {
+				buf.Write(frame.Payload)
+			}
+		default:
+			err = ErrUnknownOpcode
+			return
+		}
+	}
+}
+
 type Msg struct {
 	Opcode  Opcode
 	Payload []byte
 }
 
-func (ws *WS) ReadLoop(msgHandler func(payload []byte, ws *WS) error) error {
+type MsgHandler func(msg *Msg, ws *WS) error
+
+func (ws *WS) ReadLoop(msgHandler MsgHandler) error {
 	var buf bytes.Buffer
+	var opcode Opcode
 	for !ws.isClosed {
 		frame, err := ws.ReadFrame()
 		if err != nil {
@@ -371,7 +446,11 @@ func (ws *WS) ReadLoop(msgHandler func(payload []byte, ws *WS) error) error {
 			if frame.IsFin {
 				buf.Write(frame.Payload)
 				log.Printf("got fragmented msg: %v", buf.String())
-				if err := msgHandler(buf.Bytes(), ws); err != nil {
+				msg := Msg{
+					Opcode:  opcode,
+					Payload: buf.Bytes(),
+				}
+				if err := msgHandler(&msg, ws); err != nil {
 					return err
 				}
 				if err = ws.bufw.Flush(); err != nil {
@@ -381,11 +460,15 @@ func (ws *WS) ReadLoop(msgHandler func(payload []byte, ws *WS) error) error {
 			} else {
 				buf.Write(frame.Payload)
 			}
-		case OpcodeBin:
-		case OpcodeText:
+		case OpcodeBin, OpcodeText:
+			opcode = frame.Opcode
 			log.Printf("got data msg: %v\n", string(frame.Payload))
 			if frame.IsFin {
-				if err := msgHandler(frame.Payload, ws); err != nil {
+				msg := Msg{
+					Opcode:  opcode,
+					Payload: frame.Payload,
+				}
+				if err := msgHandler(&msg, ws); err != nil {
 					return err
 				}
 				ws.bufw.Flush()
@@ -401,32 +484,29 @@ func (ws *WS) ReadLoop(msgHandler func(payload []byte, ws *WS) error) error {
 	return nil
 }
 
-func (ws *WS) WriteData(payload []byte, opcode Opcode, isFin, needMask bool) error {
-	if ws.isClosed {
-		return ErrConnClosed
+func (ws *WS) WriteMsg(msgType Opcode, payload []byte) error {
+	var firstSent bool
+	var opcode Opcode
+	for len(payload) > MSG_MAX_CHUNK_SIZE {
+		if firstSent {
+			opcode = OpcodeCont
+		} else {
+			opcode = msgType
+			firstSent = true
+		}
+		if err := ws.WriteFrame(payload[:MSG_MAX_CHUNK_SIZE], opcode, false, ws.isClient); err != nil {
+			return err
+		}
+		payload = payload[MSG_MAX_CHUNK_SIZE:]
 	}
-	if ws.opcode != 0 {
-		opcode = OpcodeCont
-	} else {
-		ws.opcode = opcode
+	if len(payload) > 0 {
+		if firstSent {
+			opcode = OpcodeCont
+		} else {
+			opcode = msgType
+			firstSent = true
+		}
+		return ws.WriteFrame(payload, opcode, true, ws.isClient)
 	}
-
-	return ws.WriteFrame(payload, opcode, isFin, needMask)
-}
-
-func (ws *WS) ServerWriteText(payload []byte, isFin bool) error {
-	return ws.WriteData(payload, OpcodeText, isFin, false)
-}
-
-func (ws *WS) ClientWriteText(payload []byte, isFin bool) error {
-	log.Printf("cli sending text: %v\n", string(payload))
-	return ws.WriteData(payload, OpcodeText, isFin, true)
-}
-
-func (ws *WS) ServerWriteBin(payload []byte, isFin bool) error {
-	return ws.WriteData(payload, OpcodeBin, isFin, false)
-}
-
-func (ws *WS) ClientWriteBin(payload []byte, isFin bool) error {
-	return ws.WriteData(payload, OpcodeBin, isFin, true)
+	return nil
 }
