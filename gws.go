@@ -404,6 +404,13 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 			err = ErrCloseMsgRecved
 			return
 		case OpcodeCont:
+			// fragmented msg not started with a
+			// frame whose opcode is other than 0
+			if msgType == OpcodeCont {
+				_ = ws.WriteFrame(nil, OpcodeClose, true, false)
+				err = ErrBadFrameRecvd
+				return
+			}
 			// log.Println("got cont msg")
 			if frame.Fin {
 				buf.Write(frame.Payload)
@@ -427,6 +434,7 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 				buf.Write(frame.Payload)
 			}
 		default:
+			_ = ws.WriteFrame(nil, OpcodeClose, true, false)
 			err = ErrUnknownOpcode
 			return
 		}
