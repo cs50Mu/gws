@@ -17,16 +17,25 @@ import (
 )
 
 var (
-	ErrBadClientHandshake = errors.New("bad client handshake")
-	ErrUnknownOpcode      = errors.New("unknown opcode")
-	ErrConnClosed         = errors.New("conn is closed")
-	ErrCloseMsgRecved     = errors.New("Close msg is recved from the peer")
+	ErrBadClientHandshake     = errors.New("bad client handshake")
+	ErrUnknownOpcode          = errors.New("unknown opcode")
+	ErrConnClosed             = errors.New("conn is closed")
+	ErrCloseMsgRecved         = errors.New("Close msg is recved from the peer")
+	ErrExtensionNotNegotiated = errors.New("rsv1,rsv2,rsv3 MUST be 0 unless an extension is negotiated")
+	ErrControlFrameTooBig     = errors.New("Control frame is too big")
+	ErrBadFrameRecvd          = errors.New("recved bad frame from the peer")
 )
 
 const (
 	// the max chunk size when writing a frame
 	// msg with a bigger size will be splitted
-	MSG_MAX_CHUNK_SIZE = 5
+	// todo: make chunkSize customizable
+	msgMaxChunkSize = 4096
+	finalBit        = 1 << 7
+	rsv1Bit         = 1 << 6
+	rsv2Bit         = 1 << 5
+	rsv3Bit         = 1 << 4
+	maskBit         = 1 << 7
 )
 
 type WS struct {
@@ -187,6 +196,13 @@ const (
 	OpcodePong  Opcode = 0xA
 )
 
+// RFC 6455 - Section 5.5:
+// Control frames are identified by opcodes where the most significant
+// bit of the opcode is 1.
+func (oc Opcode) isControl() bool {
+	return byte(oc)&0x8 != 0
+}
+
 func (oc Opcode) String() string {
 	switch oc {
 	case OpcodeCont:
@@ -208,38 +224,28 @@ func (oc Opcode) String() string {
 
 func (ws *WS) WriteFrame(payload []byte, opcode Opcode, isFin, needMask bool) error {
 	var buf bytes.Buffer
-	var first byte
+	b0 := byte(opcode)
 	if isFin {
-		first |= 0x1 << 3
+		b0 |= finalBit
 	}
-	// opcode
-	first <<= 4
-	first |= byte(opcode)
-	buf.WriteByte(first)
+	buf.WriteByte(b0)
 	// mask and payloadLen
+	b1 := byte(0)
+	if needMask {
+		b1 |= maskBit
+	}
 	payloadLen := len(payload)
-	if payloadLen < 126 {
-		data := byte(payloadLen)
-		if needMask {
-			data |= 0x1 << 7
-		}
-		buf.WriteByte(data)
+	if payloadLen <= 125 {
+		b1 |= byte(payloadLen)
+		buf.WriteByte(b1)
 	} else if payloadLen <= math.MaxUint16 {
-		data := byte(126)
-		if needMask {
-			data |= 0x1 << 7
-		}
-		buf.WriteByte(data)
+		buf.WriteByte(b1 | 126)
 		// 2 more bytes
 		dataLen := make([]byte, 2)
 		binary.BigEndian.PutUint16(dataLen, uint16(payloadLen))
 		buf.Write(dataLen)
 	} else {
-		data := byte(127)
-		if needMask {
-			data |= 0x1 << 7
-		}
-		buf.WriteByte(data)
+		buf.WriteByte(b1 | 127)
 		// 4 more bytes
 		dataLen := make([]byte, 8)
 		binary.BigEndian.PutUint32(dataLen, uint32(payloadLen))
@@ -275,8 +281,12 @@ func maskUnmask(payload, mask []byte) []byte {
 
 type Frame struct {
 	Opcode  Opcode
+	Fin     bool
+	Rsv1    bool
+	Rsv2    bool
+	Rsv3    bool
+	Masked  bool
 	Payload []byte
-	IsFin   bool
 }
 
 func (ws *WS) ReadFrame() (*Frame, error) {
@@ -286,21 +296,35 @@ func (ws *WS) ReadFrame() (*Frame, error) {
 		return nil, err
 	}
 
-	frame := new(Frame)
-	isFinal := false
-	fin := data[0] >> 7
-	if fin == 0x1 {
-		isFinal = true
+	frame := &Frame{
+		Opcode: Opcode(data[0] & 0xf),
+		Fin:    data[0]&finalBit != 0,
+		Rsv1:   data[0]&rsv1Bit != 0,
+		Rsv2:   data[0]&rsv2Bit != 0,
+		Rsv3:   data[0]&rsv3Bit != 0,
+		Masked: data[1]&maskBit != 0,
 	}
-	opcode := data[0] & 0xf
-	frame.IsFin = isFinal
-	frame.Opcode = Opcode(opcode)
-	isMask := false
-	maskBit := data[1] >> 7
-	if maskBit == 0x1 {
-		isMask = true
+	// RFC 6455 - Section 5.2:
+	// >  RSV1, RSV2, RSV3:  1 bit each
+	// >
+	// >     MUST be 0 unless an extension is negotiated that defines meanings
+	// >     for non-zero values.  If a nonzero value is received and none of
+	// >     the negotiated extensions defines the meaning of such a nonzero
+	// >     value, the receiving endpoint MUST _Fail the WebSocket
+	// >     Connection_.
+	if frame.Rsv1 || frame.Rsv2 || frame.Rsv3 {
+		_ = ws.WriteFrame(frame.Payload, OpcodeClose, true, false)
+		return nil, ErrExtensionNotNegotiated
 	}
-	payloadLen := data[1] & (^(byte(0x1) << 7))
+
+	payloadLen := data[1] & 0x7f
+	// RFC 6455 - Section 5.5: Control Frames
+	//   All control frames MUST have a payload length of 125 bytes or less
+	//   and MUST NOT be fragmented.
+	if frame.Opcode.isControl() && (payloadLen > 125 || !frame.Fin) {
+		_ = ws.WriteFrame(frame.Payload, OpcodeClose, true, false)
+		return nil, ErrControlFrameTooBig
+	}
 
 	var realPayloadlen uint64
 	if payloadLen < 126 {
@@ -323,7 +347,7 @@ func (ws *WS) ReadFrame() (*Frame, error) {
 
 	var mask []byte
 	// masking
-	if isMask { // 4 bytes
+	if frame.Masked { // 4 bytes
 		mask = make([]byte, 4)
 		_, err := io.ReadFull(ws.bufr, mask)
 		if err != nil {
@@ -339,7 +363,7 @@ func (ws *WS) ReadFrame() (*Frame, error) {
 			return nil, err
 		}
 		// log.Printf("payload: %+v\n", payload)
-		if isMask {
+		if frame.Masked {
 			payload = maskUnmask(payload, mask)
 		}
 		frame.Payload = payload
@@ -381,7 +405,7 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 			return
 		case OpcodeCont:
 			// log.Println("got cont msg")
-			if frame.IsFin {
+			if frame.Fin {
 				buf.Write(frame.Payload)
 				// log.Printf("got fragmented msg: %v", buf.String())
 				payload = make([]byte, buf.Len())
@@ -394,7 +418,7 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 		case OpcodeBin, OpcodeText:
 			// log.Printf("got data msg: %v\n", string(frame.Payload))
 			msgType = frame.Opcode
-			if frame.IsFin {
+			if frame.Fin {
 				payload = make([]byte, len(frame.Payload))
 				copy(payload, frame.Payload) // need deep copy
 				buf.Reset()
@@ -443,7 +467,7 @@ func (ws *WS) ReadLoop(msgHandler MsgHandler) error {
 			ws.conn.Close()
 		case OpcodeCont:
 			log.Println("got cont msg")
-			if frame.IsFin {
+			if frame.Fin {
 				buf.Write(frame.Payload)
 				log.Printf("got fragmented msg: %v", buf.String())
 				msg := Msg{
@@ -463,7 +487,7 @@ func (ws *WS) ReadLoop(msgHandler MsgHandler) error {
 		case OpcodeBin, OpcodeText:
 			opcode = frame.Opcode
 			log.Printf("got data msg: %v\n", string(frame.Payload))
-			if frame.IsFin {
+			if frame.Fin {
 				msg := Msg{
 					Opcode:  opcode,
 					Payload: frame.Payload,
