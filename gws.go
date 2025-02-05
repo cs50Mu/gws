@@ -511,26 +511,23 @@ func (ws *WS) ReadLoop(msgHandler MsgHandler) error {
 func (ws *WS) WriteMsg(msgType Opcode, payload []byte) error {
 	var firstSent bool
 	var opcode Opcode
-	for len(payload) > MSG_MAX_CHUNK_SIZE {
+	for len(payload) > msgMaxChunkSize {
 		if firstSent {
 			opcode = OpcodeCont
 		} else {
 			opcode = msgType
 			firstSent = true
 		}
-		if err := ws.WriteFrame(payload[:MSG_MAX_CHUNK_SIZE], opcode, false, ws.isClient); err != nil {
+		if err := ws.WriteFrame(payload[:msgMaxChunkSize], opcode, false, ws.isClient); err != nil {
 			return err
 		}
-		payload = payload[MSG_MAX_CHUNK_SIZE:]
+		payload = payload[msgMaxChunkSize:]
 	}
-	if len(payload) > 0 {
-		if firstSent {
-			opcode = OpcodeCont
-		} else {
-			opcode = msgType
-			firstSent = true
-		}
-		return ws.WriteFrame(payload, opcode, true, ws.isClient)
+
+	if firstSent {
+		opcode = OpcodeCont
+	} else {
+		opcode = msgType
 	}
-	return nil
+	return ws.WriteFrame(payload, opcode, true, ws.isClient)
 }
