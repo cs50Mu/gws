@@ -395,9 +395,7 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 			continue
 		case OpcodeClose:
 			log.Println("got close msg")
-			if err = ws.WriteFrame(frame.Payload, OpcodeClose, true, false); err != nil {
-				return
-			}
+			_ = ws.WriteFrame(frame.Payload, OpcodeClose, true, false)
 			ws.isClosed = true
 			// close the underlying conn
 			// ws.conn.Close()
@@ -423,7 +421,13 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 				buf.Write(frame.Payload)
 			}
 		case OpcodeBin, OpcodeText:
-			// log.Printf("got data msg: %v\n", string(frame.Payload))
+			// all data frames after the initial data frame must have
+			// opcode 0.
+			if msgType != OpcodeCont {
+				_ = ws.WriteFrame(nil, OpcodeClose, true, false)
+				err = ErrBadFrameRecvd
+				return
+			}
 			msgType = frame.Opcode
 			if frame.Fin {
 				payload = make([]byte, len(frame.Payload))

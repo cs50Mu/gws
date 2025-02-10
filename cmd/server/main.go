@@ -44,11 +44,10 @@ func handleConn(conn net.Conn) {
 	for {
 		msgType, payload, err := ws.ReadMsg()
 		if err != nil {
-			log.Fatal(err)
+			return
 		}
-		log.Printf("[Server] recved msg, type: %v, payload: %+v",
-			msgType.String(), payload)
-		// echo back
+		log.Printf("[Server] recved msg, type: %v, len: %v\n",
+			msgType.String(), len(payload))
 		if err := ws.WriteMsg(msgType, payload); err != nil {
 			log.Fatal(err)
 		}
