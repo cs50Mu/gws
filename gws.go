@@ -412,6 +412,15 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 			// log.Println("got cont msg")
 			if frame.Fin {
 				buf.Write(frame.Payload)
+				// RFC 6455 - Section 8.1: Handling Errors in UTF-8-Encoded Data
+				//   When an endpoint is to interpret a byte stream as UTF-8 but finds
+				//   that the byte stream is not, in fact, a valid UTF-8 stream, that
+				//   endpoint MUST _Fail the WebSocket Connection_.
+				if msgType == OpcodeText && !utf8.Valid(buf.Bytes()) {
+					_ = ws.WriteFrame(nil, OpcodeClose, true, false)
+					err = ErrInvalidUtf8Recvd
+					return
+				}
 				// log.Printf("got fragmented msg: %v", buf.String())
 				payload = make([]byte, buf.Len())
 				copy(payload, buf.Bytes()) // need deep copy
@@ -430,6 +439,15 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 			}
 			msgType = frame.Opcode
 			if frame.Fin {
+				// RFC 6455 - Section 8.1: Handling Errors in UTF-8-Encoded Data
+				//   When an endpoint is to interpret a byte stream as UTF-8 but finds
+				//   that the byte stream is not, in fact, a valid UTF-8 stream, that
+				//   endpoint MUST _Fail the WebSocket Connection_.
+				if msgType == OpcodeText && !utf8.Valid(frame.Payload) {
+					_ = ws.WriteFrame(nil, OpcodeClose, true, false)
+					err = ErrInvalidUtf8Recvd
+					return
+				}
 				payload = make([]byte, len(frame.Payload))
 				copy(payload, frame.Payload) // need deep copy
 				buf.Reset()
