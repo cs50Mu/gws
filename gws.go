@@ -436,6 +436,7 @@ func parseCloseFrameBody(data []byte) (statusCode uint16, reason string, err err
 func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 	var frame *Frame
 	var buf bytes.Buffer
+	verifyIdx := 0
 	for {
 		frame, err = ws.ReadFrame()
 		if err != nil {
@@ -483,17 +484,36 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 			buf.Write(frame.Payload)
 			if msgType == OpcodeText {
 				framePayload := buf.Bytes()
-				for len(framePayload) > 0 {
-					_, size, parseErr := utf8ToRune(framePayload)
+				for verifyIdx < buf.Len() {
+					c, size, parseErr := utf8ToRune(framePayload[verifyIdx:])
+					log.Printf("char: %c, size: %v, err: %v\n", c, size, parseErr)
 					if parseErr != nil {
 						if parseErr == ErrShortUtf8 {
+							log.Println("got short utf8, extending it..")
+							oldPayloadLen := buf.Len()
+							// make the short utf8 byte stream complete
+							// with a bunch of zeros
+							extendUtf8Bytes(verifyIdx, &buf)
+							framePayload = buf.Bytes()
+							// log.Printf("new buf len: %v, new buf: %+v\n", buf.Len(), framePayload)
+							log.Println("extended, verify again")
+							// and check it again, now it will be a complete utf8 byte sequence
+							// if it is still not a valid utf8 byte sequence, return err immediately,
+							// in which case, the byte sequence encodes an invalid code point(either too
+							// large or in the surrogate range)
+							_, _, parseErr = utf8ToRune(framePayload[verifyIdx:])
+							if parseErr != nil {
+								err = ErrInvalidUtf8Recvd
+								return
+							}
+							buf.Truncate(oldPayloadLen)
 							break
 						} else {
 							err = ErrInvalidUtf8Recvd
 							return
 						}
 					}
-					framePayload = framePayload[size:]
+					verifyIdx += size
 				}
 			}
 			// log.Println("got cont msg")
@@ -511,6 +531,7 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 				payload = make([]byte, buf.Len())
 				copy(payload, buf.Bytes()) // need deep copy
 				buf.Reset()
+				verifyIdx = 0
 				return
 			}
 		case OpcodeBin, OpcodeText:
@@ -672,7 +693,16 @@ const (
 	rune3Max = 1<<16 - 1
 )
 
+func hexPrint(bs []byte) string {
+	var buffer strings.Builder
+	for _, b := range bs {
+		buffer.WriteString(fmt.Sprintf("\\x%X", b))
+	}
+	return buffer.String()
+}
+
 func utf8ToRune(bs []byte) (c rune, size int, err error) {
+	// log.Printf("bs: %v\n", hexPrint(bs))
 	maxSize := len(bs)
 	if maxSize < 1 {
 		err = ErrShortUtf8
@@ -792,4 +822,33 @@ func utf8ToRune(bs []byte) (c rune, size int, err error) {
 		return
 	}
 	return
+}
+
+// extendUtf8Bytes extend `bs` so that it
+// looks like a valid utf8 encoded bytes stream
+//
+// fill the missing bytes with zeros
+func extendUtf8Bytes(verifyIdx int, buf *bytes.Buffer) {
+	log.Printf("old buf len: %v, verifyIndex: %v\n", buf.Len(), verifyIdx)
+	bs := buf.Bytes()
+	first := bs[verifyIdx]
+	var size int
+	switch {
+	// only size which is greater than 2 bytes may need to extend
+	case first&t3 == t2: // 2 bytes
+		size = 2
+	case first&t4 == t3: // 3 bytes
+		size = 3
+	case first&t5 == t4: // 4 bytes
+		size = 4
+	}
+	log.Printf("size: %v\n", size)
+
+	extra := size - (buf.Len() - verifyIdx)
+	log.Printf("extra: %v\n", extra)
+	buf.Grow(extra)
+	for extra > 0 {
+		buf.WriteByte(tx)
+		extra--
+	}
 }
