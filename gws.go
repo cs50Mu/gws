@@ -14,6 +14,7 @@ import (
 	"math/rand"
 	"net"
 	"strings"
+	"unicode/utf8"
 )
 
 var (
@@ -24,6 +25,8 @@ var (
 	ErrExtensionNotNegotiated = errors.New("rsv1,rsv2,rsv3 MUST be 0 unless an extension is negotiated")
 	ErrControlFrameTooBig     = errors.New("Control frame is too big")
 	ErrBadFrameRecvd          = errors.New("recved bad frame from the peer")
+	ErrInvalidUtf8Recvd       = errors.New("invalid utf8 byte stream recvd")
+	ErrShortUtf8              = errors.New("short utf8 byte stream recvd, send more")
 )
 
 const (
@@ -372,6 +375,60 @@ func (ws *WS) ReadFrame() (*Frame, error) {
 	return frame, nil
 }
 
+// Close codes defined in RFC 6455, section 11.7.
+const (
+	CloseNormalClosure           = 1000
+	CloseGoingAway               = 1001
+	CloseProtocolError           = 1002
+	CloseUnsupportedData         = 1003
+	CloseNoStatusReceived        = 1005
+	CloseAbnormalClosure         = 1006
+	CloseInvalidFramePayloadData = 1007
+	ClosePolicyViolation         = 1008
+	CloseMessageTooBig           = 1009
+	CloseMandatoryExtension      = 1010
+	CloseInternalServerErr       = 1011
+	CloseServiceRestart          = 1012
+	CloseTryAgainLater           = 1013
+	CloseTLSHandshake            = 1015
+)
+
+var validReceivedCloseCodes = map[int]bool{
+	// see http://www.iana.org/assignments/websocket/websocket.xhtml#close-code-number
+
+	CloseNormalClosure:           true,
+	CloseGoingAway:               true,
+	CloseProtocolError:           true,
+	CloseUnsupportedData:         true,
+	CloseNoStatusReceived:        false,
+	CloseAbnormalClosure:         false,
+	CloseInvalidFramePayloadData: true,
+	ClosePolicyViolation:         true,
+	CloseMessageTooBig:           true,
+	CloseMandatoryExtension:      true,
+	CloseInternalServerErr:       true,
+	CloseServiceRestart:          true,
+	CloseTryAgainLater:           true,
+	CloseTLSHandshake:            false,
+}
+
+func isValidReceivedCloseCode(code int) bool {
+	return validReceivedCloseCodes[code] || (code >= 3000 && code <= 4999)
+}
+
+func parseCloseFrameBody(data []byte) (statusCode uint16, reason string, err error) {
+	if len(data) < 2 {
+		err = ErrBadFrameRecvd
+		return
+	}
+	statusCode = binary.BigEndian.Uint16(data[:2])
+	if !utf8.Valid(data[2:]) {
+		err = ErrInvalidUtf8Recvd
+		return
+	}
+	return statusCode, string(data[2:]), nil
+}
+
 // ReadMsg read msg from the websocket
 // only Text or Bin msg are returned for caller to handle
 // other msgs: Ping/Pong are handled automaticly, Close msg are
@@ -395,6 +452,20 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 			continue
 		case OpcodeClose:
 			log.Println("got close msg")
+			if len(frame.Payload) > 0 {
+				statusCode, reason, err := parseCloseFrameBody(frame.Payload)
+				if err != nil {
+					// fail the conn
+					_ = ws.WriteFrame(nil, OpcodeClose, true, false)
+					return 0, nil, err
+				}
+				log.Printf("statusCode: %v, reason: %s\n", statusCode, reason)
+				if !isValidReceivedCloseCode(int(statusCode)) {
+					// fail the conn
+					_ = ws.WriteFrame(nil, OpcodeClose, true, false)
+					return 0, nil, err
+				}
+			}
 			_ = ws.WriteFrame(frame.Payload, OpcodeClose, true, false)
 			ws.isClosed = true
 			// close the underlying conn
@@ -409,25 +480,38 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 				err = ErrBadFrameRecvd
 				return
 			}
+			buf.Write(frame.Payload)
+			if msgType == OpcodeText {
+				framePayload := buf.Bytes()
+				for len(framePayload) > 0 {
+					_, size, parseErr := utf8ToRune(framePayload)
+					if parseErr != nil {
+						if parseErr == ErrShortUtf8 {
+							break
+						} else {
+							err = ErrInvalidUtf8Recvd
+							return
+						}
+					}
+					framePayload = framePayload[size:]
+				}
+			}
 			// log.Println("got cont msg")
 			if frame.Fin {
-				buf.Write(frame.Payload)
-				// RFC 6455 - Section 8.1: Handling Errors in UTF-8-Encoded Data
-				//   When an endpoint is to interpret a byte stream as UTF-8 but finds
-				//   that the byte stream is not, in fact, a valid UTF-8 stream, that
-				//   endpoint MUST _Fail the WebSocket Connection_.
-				if msgType == OpcodeText && !utf8.Valid(buf.Bytes()) {
-					_ = ws.WriteFrame(nil, OpcodeClose, true, false)
-					err = ErrInvalidUtf8Recvd
-					return
-				}
+				// // RFC 6455 - Section 8.1: Handling Errors in UTF-8-Encoded Data
+				// //   When an endpoint is to interpret a byte stream as UTF-8 but finds
+				// //   that the byte stream is not, in fact, a valid UTF-8 stream, that
+				// //   endpoint MUST _Fail the WebSocket Connection_.
+				// if msgType == OpcodeText && !utf8.Valid(buf.Bytes()) {
+				// 	_ = ws.WriteFrame(nil, OpcodeClose, true, false)
+				// 	err = ErrInvalidUtf8Recvd
+				// 	return
+				// }
 				// log.Printf("got fragmented msg: %v", buf.String())
 				payload = make([]byte, buf.Len())
 				copy(payload, buf.Bytes()) // need deep copy
 				buf.Reset()
 				return
-			} else {
-				buf.Write(frame.Payload)
 			}
 		case OpcodeBin, OpcodeText:
 			// all data frames after the initial data frame must have
@@ -560,4 +644,152 @@ func (ws *WS) WriteMsg(msgType Opcode, payload []byte) error {
 		opcode = msgType
 	}
 	return ws.WriteFrame(payload, opcode, true, ws.isClient)
+}
+
+// Code points in the surrogate range are not valid for UTF-8.
+const (
+	surrogateMin = 0xD800
+	surrogateMax = 0xDFFF
+
+	maxRune = '\U0010FFFF' // Maximum valid Unicode code point.
+)
+
+const (
+	t1 = 0b00000000
+	tx = 0b10000000
+	t2 = 0b11000000
+	t3 = 0b11100000
+	t4 = 0b11110000
+	t5 = 0b11111000
+
+	maskx = 0b00111111
+	mask2 = 0b00011111
+	mask3 = 0b00001111
+	mask4 = 0b00000111
+
+	rune1Max = 1<<7 - 1
+	rune2Max = 1<<11 - 1
+	rune3Max = 1<<16 - 1
+)
+
+func utf8ToRune(bs []byte) (c rune, size int, err error) {
+	maxSize := len(bs)
+	if maxSize < 1 {
+		err = ErrShortUtf8
+		return
+	}
+	b := bs[0]
+
+	if b&tx == 0 { // 1 byte
+		size = 1
+		c = rune(b)
+		return
+	}
+
+	if b&t3 == t2 { // 2 bytes
+		if maxSize < 2 {
+			err = ErrShortUtf8
+			return
+		}
+		size = 2
+		c = (rune(b) & mask2) << 6
+		// Overlong sequence or invalid second.
+		b = bs[1]
+		if c == 0 || b&t2 != tx {
+			err = ErrInvalidUtf8Recvd
+			return
+		}
+		c += rune(b) & maskx
+		// maximum overlong sequence
+		// if c lies in the one byte range
+		// then it is a overlong sequence
+		if c <= rune1Max {
+			err = ErrInvalidUtf8Recvd
+			return
+		}
+		// UTF-16 surrogate pairs
+		if surrogateMin <= c && c <= surrogateMax {
+			err = ErrInvalidUtf8Recvd
+			return
+		}
+		return
+	}
+
+	if b&t4 == t3 { // 3 bytes
+		if maxSize < 3 {
+			err = ErrShortUtf8
+			return
+		}
+		size = 3
+		c = (rune(b) & mask3) << 12
+		b = bs[1]
+		if b&t2 != tx {
+			err = ErrInvalidUtf8Recvd
+			return
+		}
+		c += (rune(b) & maskx) << 6
+		b = bs[2]
+		// Overlong sequence or invalid last
+		if c == 0 || b&t2 != tx {
+			err = ErrInvalidUtf8Recvd
+			return
+		}
+		c += rune(b) & maskx
+		// NEW: maximum overlong sequence
+		if c <= rune2Max {
+			err = ErrInvalidUtf8Recvd
+			return
+		}
+		// UTF-16 surrogate pairs
+		if surrogateMin <= c && c <= surrogateMax {
+			err = ErrInvalidUtf8Recvd
+			return
+		}
+		return
+	}
+	if maxSize < 4 { // 4 bytes
+		err = ErrShortUtf8
+		return
+	}
+	if b&t5 != t4 {
+		err = ErrInvalidUtf8Recvd
+		return
+	}
+	size = 4
+	c = (rune(b) & mask4) << 18
+	b = bs[1]
+	if b&t2 != tx {
+		err = ErrInvalidUtf8Recvd
+		return
+	}
+	c += (rune(b) & maskx) << 12
+	b = bs[2]
+	if b&t2 != tx {
+		err = ErrInvalidUtf8Recvd
+		return
+	}
+	c += (rune(b) & maskx) << 6
+	b = bs[3]
+	// Overlong sequence or invalid last
+	if c == 0 || b&t2 != tx {
+		err = ErrInvalidUtf8Recvd
+		return
+	}
+	c += rune(b) & maskx
+	// maximum overlong sequence
+	if c <= rune3Max {
+		err = ErrInvalidUtf8Recvd
+		return
+	}
+	// UTF-16 surrogate pairs
+	if surrogateMin <= c && c <= surrogateMax {
+		err = ErrInvalidUtf8Recvd
+		return
+	}
+	// Maximum valid Unicode number
+	if c > maxRune {
+		err = ErrInvalidUtf8Recvd
+		return
+	}
+	return
 }
