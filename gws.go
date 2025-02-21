@@ -265,7 +265,7 @@ func (ws *WS) WriteFrame(payload []byte, opcode Opcode, isFin, needMask bool) er
 	}
 	// payload
 	if needMask {
-		payload = maskUnmask(payload, mask)
+		maskUnmask(payload, mask, 0)
 	}
 	buf.Write(payload)
 
@@ -273,33 +273,31 @@ func (ws *WS) WriteFrame(payload []byte, opcode Opcode, isFin, needMask bool) er
 	return ws.bufw.Flush()
 }
 
-func maskUnmask(payload, mask []byte) []byte {
-	res := make([]byte, len(payload))
+func maskUnmask(payload, mask []byte, idx uint64) {
 	for i := 0; i < len(payload); i++ {
-		res[i] = payload[i] ^ mask[i%4]
+		payload[i] = payload[i] ^ mask[(idx+uint64(i))%4]
 	}
-
-	return res
 }
 
-type Frame struct {
-	Opcode  Opcode
-	Fin     bool
-	Rsv1    bool
-	Rsv2    bool
-	Rsv3    bool
-	Masked  bool
-	Payload []byte
+type FrameHeader struct {
+	Opcode     Opcode
+	Fin        bool
+	Rsv1       bool
+	Rsv2       bool
+	Rsv3       bool
+	Masked     bool
+	MaskKey    []byte
+	PayloadLen uint64
 }
 
-func (ws *WS) ReadFrame() (*Frame, error) {
+func (ws *WS) readFrameHeader() (*FrameHeader, error) {
 	data := make([]byte, 2)
 	_, err := io.ReadFull(ws.bufr, data)
 	if err != nil {
 		return nil, err
 	}
 
-	frame := &Frame{
+	frame := &FrameHeader{
 		Opcode: Opcode(data[0] & 0xf),
 		Fin:    data[0]&finalBit != 0,
 		Rsv1:   data[0]&rsv1Bit != 0,
@@ -316,7 +314,7 @@ func (ws *WS) ReadFrame() (*Frame, error) {
 	// >     value, the receiving endpoint MUST _Fail the WebSocket
 	// >     Connection_.
 	if frame.Rsv1 || frame.Rsv2 || frame.Rsv3 {
-		_ = ws.WriteFrame(frame.Payload, OpcodeClose, true, false)
+		_ = ws.WriteFrame(nil, OpcodeClose, true, false)
 		return nil, ErrExtensionNotNegotiated
 	}
 
@@ -325,7 +323,7 @@ func (ws *WS) ReadFrame() (*Frame, error) {
 	//   All control frames MUST have a payload length of 125 bytes or less
 	//   and MUST NOT be fragmented.
 	if frame.Opcode.isControl() && (payloadLen > 125 || !frame.Fin) {
-		_ = ws.WriteFrame(frame.Payload, OpcodeClose, true, false)
+		_ = ws.WriteFrame(nil, OpcodeClose, true, false)
 		return nil, ErrControlFrameTooBig
 	}
 
@@ -348,6 +346,7 @@ func (ws *WS) ReadFrame() (*Frame, error) {
 		realPayloadlen = binary.BigEndian.Uint64(data)
 	}
 
+	frame.PayloadLen = realPayloadlen
 	var mask []byte
 	// masking
 	if frame.Masked { // 4 bytes
@@ -356,23 +355,38 @@ func (ws *WS) ReadFrame() (*Frame, error) {
 		if err != nil {
 			return nil, err
 		}
+		frame.MaskKey = mask
 	}
 	log.Printf("recved payloadLen: %v\n", realPayloadlen)
-	// payload
-	if realPayloadlen > 0 {
-		payload := make([]byte, realPayloadlen)
-		_, err = io.ReadFull(ws.bufr, payload)
-		if err != nil {
-			return nil, err
-		}
-		// log.Printf("payload: %+v\n", payload)
-		if frame.Masked {
-			payload = maskUnmask(payload, mask)
-		}
-		frame.Payload = payload
-	}
-
 	return frame, nil
+}
+
+func (ws *WS) readFramePayloadChunk(frame *FrameHeader, payload []byte, idx uint64) (int, error) {
+	n, err := ws.bufr.Read(payload)
+	if err != nil {
+		return 0, err
+	}
+	if frame.Masked {
+		maskUnmask(payload[:n], frame.MaskKey, idx)
+	}
+	return n, nil
+}
+
+func (ws *WS) readFramePayload(frame *FrameHeader) ([]byte, error) {
+	var payload []byte
+	// log.Printf("frame: %+v\n", frame)
+	if frame.PayloadLen > 0 {
+		payload = make([]byte, frame.PayloadLen)
+		idx := uint64(0) // the index of the payload to write for the next Read
+		for idx < frame.PayloadLen {
+			n, err := ws.readFramePayloadChunk(frame, payload[idx:], idx)
+			if err != nil {
+				return nil, err
+			}
+			idx += uint64(n)
+		}
+	}
+	return payload, nil
 }
 
 // Close codes defined in RFC 6455, section 11.7.
@@ -433,19 +447,24 @@ func parseCloseFrameBody(data []byte) (statusCode uint16, reason string, err err
 // only Text or Bin msg are returned for caller to handle
 // other msgs: Ping/Pong are handled automaticly, Close msg are
 // returned as error
-func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
-	var frame *Frame
+func (ws *WS) ReadMsg() (msgType Opcode, msgPayload []byte, err error) {
+	var header *FrameHeader
 	var buf bytes.Buffer
+	var framePayload []byte
 	verifyIdx := 0
 	for {
-		frame, err = ws.ReadFrame()
+		header, err = ws.readFrameHeader()
 		if err != nil {
 			return
 		}
-		switch frame.Opcode {
+		framePayload, err = ws.readFramePayload(header)
+		if err != nil {
+			return
+		}
+		switch header.Opcode {
 		case OpcodePing:
 			log.Println("got ping msg")
-			if err = ws.WriteFrame(frame.Payload, OpcodePong, true, false); err != nil {
+			if err = ws.WriteFrame(framePayload, OpcodePong, true, false); err != nil {
 				return
 			}
 		case OpcodePong:
@@ -453,8 +472,8 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 			continue
 		case OpcodeClose:
 			log.Println("got close msg")
-			if len(frame.Payload) > 0 {
-				statusCode, reason, err := parseCloseFrameBody(frame.Payload)
+			if len(framePayload) > 0 {
+				statusCode, reason, err := parseCloseFrameBody(framePayload)
 				if err != nil {
 					// fail the conn
 					_ = ws.WriteFrame(nil, OpcodeClose, true, false)
@@ -467,7 +486,7 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 					return 0, nil, err
 				}
 			}
-			_ = ws.WriteFrame(frame.Payload, OpcodeClose, true, false)
+			_ = ws.WriteFrame(framePayload, OpcodeClose, true, false)
 			ws.isClosed = true
 			// close the underlying conn
 			// ws.conn.Close()
@@ -481,12 +500,12 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 				err = ErrBadFrameRecvd
 				return
 			}
-			buf.Write(frame.Payload)
+			buf.Write(framePayload)
 			if msgType == OpcodeText {
 				framePayload := buf.Bytes()
 				for verifyIdx < buf.Len() {
-					c, size, parseErr := utf8ToRune(framePayload[verifyIdx:])
-					log.Printf("char: %c, size: %v, err: %v\n", c, size, parseErr)
+					_, size, parseErr := utf8ToRune(framePayload[verifyIdx:])
+					// log.Printf("char: %c, size: %v, err: %v\n", c, size, parseErr)
 					if parseErr != nil {
 						if parseErr == ErrShortUtf8 {
 							log.Println("got short utf8, extending it..")
@@ -517,7 +536,7 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 				}
 			}
 			// log.Println("got cont msg")
-			if frame.Fin {
+			if header.Fin {
 				// // RFC 6455 - Section 8.1: Handling Errors in UTF-8-Encoded Data
 				// //   When an endpoint is to interpret a byte stream as UTF-8 but finds
 				// //   that the byte stream is not, in fact, a valid UTF-8 stream, that
@@ -528,8 +547,8 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 				// 	return
 				// }
 				// log.Printf("got fragmented msg: %v", buf.String())
-				payload = make([]byte, buf.Len())
-				copy(payload, buf.Bytes()) // need deep copy
+				msgPayload = make([]byte, buf.Len())
+				copy(msgPayload, buf.Bytes()) // need deep copy
 				buf.Reset()
 				verifyIdx = 0
 				return
@@ -542,23 +561,24 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 				err = ErrBadFrameRecvd
 				return
 			}
-			msgType = frame.Opcode
-			if frame.Fin {
+			msgType = header.Opcode
+			if header.Fin {
 				// RFC 6455 - Section 8.1: Handling Errors in UTF-8-Encoded Data
 				//   When an endpoint is to interpret a byte stream as UTF-8 but finds
 				//   that the byte stream is not, in fact, a valid UTF-8 stream, that
 				//   endpoint MUST _Fail the WebSocket Connection_.
-				if msgType == OpcodeText && !utf8.Valid(frame.Payload) {
+				if msgType == OpcodeText && !utf8.Valid(framePayload) {
 					_ = ws.WriteFrame(nil, OpcodeClose, true, false)
 					err = ErrInvalidUtf8Recvd
 					return
 				}
-				payload = make([]byte, len(frame.Payload))
-				copy(payload, frame.Payload) // need deep copy
+				// msgPayload = make([]byte, len(framePayload))
+				// copy(msgPayload, framePayload) // need deep copy
+				msgPayload = framePayload
 				buf.Reset()
 				return
 			} else {
-				buf.Write(frame.Payload)
+				buf.Write(framePayload)
 			}
 		default:
 			_ = ws.WriteFrame(nil, OpcodeClose, true, false)
@@ -566,81 +586,6 @@ func (ws *WS) ReadMsg() (msgType Opcode, payload []byte, err error) {
 			return
 		}
 	}
-}
-
-type Msg struct {
-	Opcode  Opcode
-	Payload []byte
-}
-
-type MsgHandler func(msg *Msg, ws *WS) error
-
-func (ws *WS) ReadLoop(msgHandler MsgHandler) error {
-	var buf bytes.Buffer
-	var opcode Opcode
-	for !ws.isClosed {
-		frame, err := ws.ReadFrame()
-		if err != nil {
-			return err
-		}
-		switch frame.Opcode {
-		case OpcodePing:
-			log.Println("got ping msg")
-			if err := ws.WriteFrame(frame.Payload, OpcodePong, true, false); err != nil {
-				return err
-			}
-		case OpcodePong:
-			// ignore
-			continue
-		case OpcodeClose:
-			log.Println("got close msg")
-			if err := ws.WriteFrame(frame.Payload, OpcodeClose, true, false); err != nil {
-				return err
-			}
-			ws.isClosed = true
-			// close the underlying conn
-			ws.conn.Close()
-		case OpcodeCont:
-			log.Println("got cont msg")
-			if frame.Fin {
-				buf.Write(frame.Payload)
-				log.Printf("got fragmented msg: %v", buf.String())
-				msg := Msg{
-					Opcode:  opcode,
-					Payload: buf.Bytes(),
-				}
-				if err := msgHandler(&msg, ws); err != nil {
-					return err
-				}
-				if err = ws.bufw.Flush(); err != nil {
-					return err
-				}
-				buf.Reset()
-			} else {
-				buf.Write(frame.Payload)
-			}
-		case OpcodeBin, OpcodeText:
-			opcode = frame.Opcode
-			log.Printf("got data msg: %v\n", string(frame.Payload))
-			if frame.Fin {
-				msg := Msg{
-					Opcode:  opcode,
-					Payload: frame.Payload,
-				}
-				if err := msgHandler(&msg, ws); err != nil {
-					return err
-				}
-				ws.bufw.Flush()
-				buf.Reset()
-			} else {
-				// todo: will it really return error?
-				buf.Write(frame.Payload)
-			}
-		default:
-			return ErrUnknownOpcode
-		}
-	}
-	return nil
 }
 
 func (ws *WS) WriteMsg(msgType Opcode, payload []byte) error {

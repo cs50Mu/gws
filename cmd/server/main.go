@@ -44,6 +44,7 @@ func handleConn(conn net.Conn) {
 	for {
 		msgType, payload, err := ws.ReadMsg()
 		if err != nil {
+			log.Printf("err: %v\n", err)
 			return
 		}
 		log.Printf("[Server] recved msg, type: %v, len: %v\n",
@@ -57,10 +58,4 @@ func handleConn(conn net.Conn) {
 func badRequest(conn net.Conn) {
 	conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n"))
 	conn.Write([]byte("\r\n"))
-}
-
-func msgHandler(msg *gws.Msg, ws *gws.WS) error {
-	log.Printf("[Server] reved msg, type: %v, payload: %+v\n",
-		msg.Opcode.String(), msg.Payload)
-	return ws.WriteMsg(msg.Opcode, msg.Payload)
 }

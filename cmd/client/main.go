@@ -60,10 +60,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// if err = ws.ReadLoop(msgHandler); err != nil {
-	// 	log.Fatal(err)
-	// }
-
 	for {
 		msgType, payload, err := ws.ReadMsg()
 		if err != nil {
@@ -71,10 +67,4 @@ func main() {
 		}
 		log.Printf("[client] recved msg, type: %v, payload: %+v\n", msgType.String(), payload)
 	}
-}
-
-func msgHandler(msg *gws.Msg, ws *gws.WS) error {
-	var _ = msg
-	var _ = ws
-	return nil
 }
