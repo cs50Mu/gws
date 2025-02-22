@@ -457,10 +457,83 @@ func (ws *WS) ReadMsg() (msgType Opcode, msgPayload []byte, err error) {
 		if err != nil {
 			return
 		}
-		framePayload, err = ws.readFramePayload(header)
-		if err != nil {
-			return
+
+		switch header.Opcode {
+		case OpcodeText, OpcodeBin:
+			// all data frames after the initial
+			// data frame must have opcode 0.
+			if msgType != OpcodeCont {
+				_ = ws.WriteFrame(nil, OpcodeClose, true, false)
+				err = ErrBadFrameRecvd
+				return
+			}
+			msgType = header.Opcode
 		}
+		if !header.Opcode.isControl() && msgType == OpcodeText && header.PayloadLen > 0 {
+			framePayload = make([]byte, header.PayloadLen)
+			idx := uint64(0) // the index of the payload to write for the next Read
+			var n int
+			for idx < header.PayloadLen {
+				n, err = ws.readFramePayloadChunk(header, framePayload[idx:], idx)
+				if err != nil {
+					return
+				}
+				buf.Write(framePayload[idx : idx+uint64(n)])
+				idx += uint64(n)
+				// check utf8
+				// RFC 6455 - Section 8.1: Handling Errors in UTF-8-Encoded Data
+				//   When an endpoint is to interpret a byte stream as UTF-8 but finds
+				//   that the byte stream is not, in fact, a valid UTF-8 stream, that
+				//   endpoint MUST _Fail the WebSocket Connection_.
+				//
+				// In order to fail fast on invalid utf8 byte stream, we need to check
+				// the bytes by tcp chunk, but actually the fail fast "feature" is not
+				// required by the rfc, it is from the Autobahn Websocket Testsuite
+				// refer to: Autobahn WebSocket Testsuite Case 6.4.*
+				msgCurr := buf.Bytes()
+				for verifyIdx < buf.Len() {
+					_, size, parseErr := utf8ToRune(msgCurr[verifyIdx:])
+					// log.Printf("char: %c, size: %v, err: %v\n", c, size, parseErr)
+					if parseErr != nil {
+						if parseErr == ErrShortUtf8 && !header.Fin {
+							log.Println("got short utf8, extending it..")
+							oldPayloadLen := buf.Len()
+							// make the short utf8 byte stream
+							// complete with a bunch of zeros
+							extendUtf8Bytes(verifyIdx, &buf)
+							msgCurr = buf.Bytes()
+							log.Println("extended, verify again")
+							// and check it again, now it will be a
+							// complete utf8 byte sequence if it is
+							// still not a valid utf8 byte sequence,
+							// return err immediately, in which case,
+							// the byte sequence encodes an invalid
+							// code point(either too large or in the
+							// surrogate range)
+							_, _, parseErr = utf8ToRune(msgCurr[verifyIdx:])
+							if parseErr != nil {
+								_ = ws.WriteFrame(nil, OpcodeClose, true, false)
+								err = ErrInvalidUtf8Recvd
+								return
+							}
+							buf.Truncate(oldPayloadLen)
+							break
+						} else {
+							_ = ws.WriteFrame(nil, OpcodeClose, true, false)
+							err = ErrInvalidUtf8Recvd
+							return
+						}
+					}
+					verifyIdx += size
+				}
+			}
+		} else {
+			framePayload, err = ws.readFramePayload(header)
+			if err != nil {
+				return
+			}
+		}
+		// payload has been fullly read by now
 		switch header.Opcode {
 		case OpcodePing:
 			log.Println("got ping msg")
@@ -500,53 +573,9 @@ func (ws *WS) ReadMsg() (msgType Opcode, msgPayload []byte, err error) {
 				err = ErrBadFrameRecvd
 				return
 			}
-			buf.Write(framePayload)
-			if msgType == OpcodeText {
-				framePayload := buf.Bytes()
-				for verifyIdx < buf.Len() {
-					_, size, parseErr := utf8ToRune(framePayload[verifyIdx:])
-					// log.Printf("char: %c, size: %v, err: %v\n", c, size, parseErr)
-					if parseErr != nil {
-						if parseErr == ErrShortUtf8 {
-							log.Println("got short utf8, extending it..")
-							oldPayloadLen := buf.Len()
-							// make the short utf8 byte stream complete
-							// with a bunch of zeros
-							extendUtf8Bytes(verifyIdx, &buf)
-							framePayload = buf.Bytes()
-							// log.Printf("new buf len: %v, new buf: %+v\n", buf.Len(), framePayload)
-							log.Println("extended, verify again")
-							// and check it again, now it will be a complete utf8 byte sequence
-							// if it is still not a valid utf8 byte sequence, return err immediately,
-							// in which case, the byte sequence encodes an invalid code point(either too
-							// large or in the surrogate range)
-							_, _, parseErr = utf8ToRune(framePayload[verifyIdx:])
-							if parseErr != nil {
-								err = ErrInvalidUtf8Recvd
-								return
-							}
-							buf.Truncate(oldPayloadLen)
-							break
-						} else {
-							err = ErrInvalidUtf8Recvd
-							return
-						}
-					}
-					verifyIdx += size
-				}
-			}
+			// buf.Write(framePayload)
 			// log.Println("got cont msg")
 			if header.Fin {
-				// // RFC 6455 - Section 8.1: Handling Errors in UTF-8-Encoded Data
-				// //   When an endpoint is to interpret a byte stream as UTF-8 but finds
-				// //   that the byte stream is not, in fact, a valid UTF-8 stream, that
-				// //   endpoint MUST _Fail the WebSocket Connection_.
-				// if msgType == OpcodeText && !utf8.Valid(buf.Bytes()) {
-				// 	_ = ws.WriteFrame(nil, OpcodeClose, true, false)
-				// 	err = ErrInvalidUtf8Recvd
-				// 	return
-				// }
-				// log.Printf("got fragmented msg: %v", buf.String())
 				msgPayload = make([]byte, buf.Len())
 				copy(msgPayload, buf.Bytes()) // need deep copy
 				buf.Reset()
@@ -554,31 +583,10 @@ func (ws *WS) ReadMsg() (msgType Opcode, msgPayload []byte, err error) {
 				return
 			}
 		case OpcodeBin, OpcodeText:
-			// all data frames after the initial data frame must have
-			// opcode 0.
-			if msgType != OpcodeCont {
-				_ = ws.WriteFrame(nil, OpcodeClose, true, false)
-				err = ErrBadFrameRecvd
-				return
-			}
-			msgType = header.Opcode
 			if header.Fin {
-				// RFC 6455 - Section 8.1: Handling Errors in UTF-8-Encoded Data
-				//   When an endpoint is to interpret a byte stream as UTF-8 but finds
-				//   that the byte stream is not, in fact, a valid UTF-8 stream, that
-				//   endpoint MUST _Fail the WebSocket Connection_.
-				if msgType == OpcodeText && !utf8.Valid(framePayload) {
-					_ = ws.WriteFrame(nil, OpcodeClose, true, false)
-					err = ErrInvalidUtf8Recvd
-					return
-				}
-				// msgPayload = make([]byte, len(framePayload))
-				// copy(msgPayload, framePayload) // need deep copy
 				msgPayload = framePayload
 				buf.Reset()
 				return
-			} else {
-				buf.Write(framePayload)
 			}
 		default:
 			_ = ws.WriteFrame(nil, OpcodeClose, true, false)
@@ -721,13 +729,13 @@ func utf8ToRune(bs []byte) (c rune, size int, err error) {
 			return
 		}
 		return
+	} // it must be a 4 bytes utf8 stream, or error
+	if b&t5 != t4 {
+		err = ErrInvalidUtf8Recvd
+		return
 	}
 	if maxSize < 4 { // 4 bytes
 		err = ErrShortUtf8
-		return
-	}
-	if b&t5 != t4 {
-		err = ErrInvalidUtf8Recvd
 		return
 	}
 	size = 4
