@@ -28,29 +28,27 @@ func main() {
 }
 
 func handleConn(conn net.Conn) {
-	defer conn.Close()
 	// handle conn
 	ws := gws.NewServerWS(conn)
+	defer ws.Close()
+
 	if err := ws.ServerHandshake(); err != nil {
 		badRequest(conn)
 		return
 	}
 	log.Println("server handshake done")
 
-	// if err := ws.ReadLoop(msgHandler); err != nil {
-	// 	log.Printf("ServerLoop failed, err: %v", err)
-	// }
-
 	for {
 		msgType, payload, err := ws.ReadMsg()
 		if err != nil {
-			log.Printf("err: %v\n", err)
+			log.Printf("Read Msg err: %v\n", err)
 			return
 		}
 		log.Printf("[Server] recved msg, type: %v, len: %v\n",
 			msgType.String(), len(payload))
 		if err := ws.WriteMsg(msgType, payload); err != nil {
-			log.Fatal(err)
+			log.Printf("WriteMsg err: %v\n", err)
+			return
 		}
 	}
 }

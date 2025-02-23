@@ -67,6 +67,30 @@ func NewServerWS(conn net.Conn) *WS {
 	return newWS(conn, false)
 }
 
+// Close the websocket and underlying conn.
+// must close the conn as follows, or may
+// lose data
+// refer: https://blog.netherlabs.nl/articles/2009/01/18/the-ultimate-so_linger-page-or-why-is-my-tcp-not-reliable
+// also many thanks to Mr Zozin: https://www.youtube.com/watch?v=JRTLSxGf_6w
+func (ws *WS) Close() {
+	c := ws.conn.(*net.TCPConn)
+	// shutdown the writing side of the conn
+	// Informing the OS that we are not planning to send anything anymore
+	c.CloseWrite()
+	// drain the conn.
+	// Depleting input before closing socket, so the OS does not send
+	// RST just because we have some input pending on close
+	buf := make([]byte, 1024)
+	for {
+		_, err := c.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+	// Actually destroying the socket
+	c.Close()
+}
+
 func (ws *WS) ServerHandshake() error {
 	statusLine, err := ws.bufr.ReadString('\n')
 	if err != nil {
